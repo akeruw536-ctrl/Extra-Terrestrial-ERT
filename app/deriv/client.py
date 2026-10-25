@@ -550,9 +550,17 @@ class DerivClient:
 
     async def subscribe_contract(self, contract_id: str, callback) -> str:
         key = f"contract:{contract_id}"
-        if contract_id not in self._contract_queues:
-            self._contract_queues[contract_id] = asyncio.Queue(maxsize=50)
-        request = {"proposal_open_contract": 1, "contract_id": contract_id, "subscribe": 1}
+        cid_key = str(contract_id)  # queues/routing are keyed by the string form
+        if cid_key not in self._contract_queues:
+            self._contract_queues[cid_key] = asyncio.Queue(maxsize=50)
+        # Deriv's current API rejects a string contract_id ("InputValidationFailed:
+        # contract_id"): it must go over the wire as an integer. Everything else in
+        # the bot keeps the id as a string, so convert only here.
+        try:
+            wire_id = int(contract_id)
+        except (TypeError, ValueError):
+            wire_id = contract_id
+        request = {"proposal_open_contract": 1, "contract_id": wire_id, "subscribe": 1}
         resp = await self.send(request)
         sub_id = (resp.get("subscription") or {}).get("id")
         self._subscriptions[key] = Subscription(request=request, callback=callback, subscription_id=sub_id)
