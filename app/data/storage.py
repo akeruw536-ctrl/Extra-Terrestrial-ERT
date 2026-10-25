@@ -10,6 +10,7 @@ working deployment.
 from __future__ import annotations
 
 import json
+import os
 import time
 from typing import Any, Dict, List, Optional
 
@@ -19,6 +20,7 @@ from sqlalchemy import (
     JSON, Column, DateTime, Float, Integer, MetaData, String, Table, create_engine, func as sa_func,
     inspect, insert, select, text, update
 )
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.sql import func
 
 metadata = MetaData()
@@ -133,22 +135,80 @@ class Storage:
     def __init__(self, database_url: str, sqlite_path: str, logger, schema: str = ""):
         self.logger = logger
         self.schema = None
+        self.sqlite_path = sqlite_path
         if database_url:
-            url = database_url
-            url = normalize_db_url(url)
-            self.engine = create_engine(url, pool_pre_ping=True)
+            try:
+                self._connect_postgres(normalize_db_url(database_url), schema)
+            except OperationalError as exc:
+                # A database that is down, paused (Supabase free tier pauses
+                # idle projects) or briefly unreachable through the pooler used
+                # to raise straight out of Bot.__init__ and crash-loop the
+                # container until Railway gave up. Retry first (done above),
+                # then degrade to local SQLite so the bot keeps running.
+                # Set DB_FALLBACK_TO_SQLITE=false to fail hard instead.
+                first_line = str(exc.orig if getattr(exc, "orig", None) else exc).strip().splitlines()[0]
+                if os.getenv("DB_FALLBACK_TO_SQLITE", "true").strip().lower() not in ("1", "true", "yes", "on"):
+                    raise
+                self.logger.error(
+                    f"Storage: DATABASE_URL unreachable after retries ({first_line}). "
+                    f"FALLING BACK to local SQLite at {sqlite_path} -- data is EPHEMERAL on "
+                    f"Railway and will be lost on redeploy. Fix the database and redeploy."
+                )
+                self._use_sqlite()
+        else:
+            self._use_sqlite()
+
+    def _use_sqlite(self) -> None:
+        self.schema = None
+        directory = os.path.dirname(self.sqlite_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        self.engine = create_engine(f"sqlite:///{self.sqlite_path}", connect_args={"check_same_thread": False})
+        self.logger.info(f"Storage: using local SQLite at {self.sqlite_path}")
+
+    def _connect_postgres(self, url: str, schema: str) -> None:
+        """Connect with bounded retry/backoff. Raises the last OperationalError
+        if every attempt fails (caller decides whether to fall back).
+
+        Tunables (env): DB_CONNECT_RETRIES (default 4), DB_CONNECT_TIMEOUT
+        seconds per attempt (default 10)."""
+        attempts = max(1, int(os.getenv("DB_CONNECT_RETRIES", "4")))
+        timeout = int(os.getenv("DB_CONNECT_TIMEOUT", "10"))
+        backoff = 2.0
+        last: Optional[OperationalError] = None
+        for attempt in range(1, attempts + 1):
+            engine = create_engine(
+                url,
+                pool_pre_ping=True,
+                pool_recycle=300,  # poolers drop idle server connections
+                connect_args={"connect_timeout": timeout},
+            )
+            try:
+                with engine.begin() as conn:
+                    if schema:
+                        # every table this bot touches lives in its own schema, so it can
+                        # share a database with other bots that use the same table names
+                        conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+                    else:
+                        conn.execute(text("SELECT 1"))
+            except OperationalError as exc:
+                engine.dispose()
+                last = exc
+                reason = str(exc.orig if getattr(exc, "orig", None) else exc).strip().splitlines()[0]
+                self.logger.warning(f"Storage: database connect attempt {attempt}/{attempts} failed: {reason}")
+                if attempt < attempts:
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 30.0)
+                continue
             if schema:
-                # every table this bot touches lives in its own schema, so it can
-                # share a database with other bots that use the same table names
-                with self.engine.begin() as conn:
-                    conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
-                self.engine = self.engine.execution_options(schema_translate_map={None: schema})
+                engine = engine.execution_options(schema_translate_map={None: schema})
                 self.schema = schema
+            self.engine = engine
             self.logger.info("Storage: connected to external database via DATABASE_URL"
                              + (f" (schema {schema})" if schema else ""))
-        else:
-            self.engine = create_engine(f"sqlite:///{sqlite_path}", connect_args={"check_same_thread": False})
-            self.logger.info(f"Storage: using local SQLite at {sqlite_path}")
+            return
+        assert last is not None
+        raise last
 
     def init_schema(self) -> None:
         metadata.create_all(self.engine)
